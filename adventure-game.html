@@ -453,14 +453,7 @@
                 this.storyManager = new StoryConsistencyManager();
                 this.characterManager = new CharacterConsistencyManager();
                 this.dialogueManager = new DialogueConsistencyManager();
-                
-                // Game nodes
-                this.nodes = {
-                    storyGenerator: this._generateStory.bind(this),
-                    actionProcessor: this._processAction.bind(this),
-                    sceneUpdater: this._updateScene.bind(this),
-                    clueManager: this._manageClues.bind(this)
-                };
+                this.gameStateManager = new GameStateConsistencyManager();
                 
                 // Action definitions
                 this.ACTIONS = {
@@ -477,6 +470,14 @@
 
                 // Debug mode
                 this.debugMode = false;
+
+                this.debugCharacters = () => {
+                    console.log("=== キャラクターデバッグ情報 ===");
+                    console.log("ストーリーキャラクター:", this.story?.characters);
+                    console.log("ゲーム状態キャラクター:", this.gameState?.characters);
+                    console.log("出会ったキャラクター:", this.gameState?.game_progress?.met_characters);
+                    console.log("========================");
+                };
             }
             
             /**
@@ -584,7 +585,7 @@
                     
                     // Get the opening scene description
                     const initialScene = await this.getInitialScene();
-                    
+                    this.debugCharacters();
                     return initialScene;
                 } catch (error) {
                     console.error("Error creating game:", error);
@@ -626,9 +627,12 @@
              */
             async processAction(action, target) {
                 try {
-                    this.debug(`Processing action: ${action} ${target}`);
+                    this.debug(`アクション処理: ${action} ${target}`);
                     
-                    // Add the player action to messages
+                    // 現在の状態を保存
+                    this.gameStateManager.saveLastValidState(this.gameState);
+                    
+                    // プレイヤーのアクションをメッセージに追加
                     this.gameState.messages.push({
                         type: "player",
                         content: `${action} ${target}`,
@@ -636,23 +640,167 @@
                         target
                     });
                     
-                    // Process the action through the graph
-                    const result = await this.nodes.actionProcessor(this.gameState, action, target);
+                    // アクションを処理
+                    const result = await this._processAction(this.gameState, action, target);
                     
-                    // Update the game state
-                    this.gameState = await this.nodes.sceneUpdater(result);
+                    // 整合性チェック
+                    const validatedState = this.gameStateManager.ensureConsistency(result, this.story);
                     
-                    // Manage clues
-                    this.gameState = await this.nodes.clueManager(this.gameState);
+                    // ゲーム状態を更新
+                    this.gameState = validatedState;
                     
-                    return {
-                        description: result.description,
-                        available_actions: this.gameState.available_actions,
-                        new_clues: result.new_clues || [],
-                        new_items: result.new_items || []
-                    };
+                    return this.gameState;
                 } catch (error) {
-                    console.error("Error processing action:", error);
+                    console.error("アクション処理エラー:", error);
+                    throw error;
+                }
+            }
+
+            async _processAction(state, action, target) {
+                try {
+                    this.debug(`アクション処理: ${action} ${target}`);
+                    
+                    // OpenAI APIを使用してアクションを処理
+                    const messages = [
+                        {
+                            role: "system",
+                            content: "あなたは、プレイヤーのアクションを処理するアドベンチャーゲームエンジンです。レスポンスを有効なJSONとして返してください。レスポンスにバックスティック（`）やその他の書式を使用しないでください。言語は日本語で書いてください。"
+                        },
+                        {
+                            role: "user",
+                            content: `プレイヤーのアクションを処理:
+                            
+アクション: ${action}
+ターゲット: ${target}
+現在のシーン: ${state.current_scene}
+ストーリーコンテキスト: ${JSON.stringify(this.story)}
+インベントリ: ${JSON.stringify(state.inventory)}
+発見した手がかり: ${JSON.stringify(state.discovered_clues)}
+ゲームの進行: ${JSON.stringify(state.game_progress)}
+
+結果をJSON形式で返してください:
+{
+    "next_scene": "次のシーンのID",
+    "description": "何が起こったかの詳細な説明",
+    "new_clues": ["発見された新しい手がかり"],
+    "new_items": ["取得された新しいアイテム"],
+    "available_actions": ["このアクションの後に利用可能なアクション"]
+}`
+                        }
+                    ];
+                    
+                    const completion = await this._callOpenAI(messages);
+                    const result = this._safeParseJSON(completion);
+                    
+                    this.debug(`アクション処理結果: ${JSON.stringify(result)}`);
+                    
+                    // 新しい手がかりを追加
+                    if (result.new_clues && result.new_clues.length > 0) {
+                        this.debug(`新しい手がかり: ${JSON.stringify(result.new_clues)}`);
+                        
+                        for (const clue of result.new_clues) {
+                            // 手がかりが既に存在するかチェック（IDまたは名前で）
+                            const existingClue = state.discovered_clues.find(
+                                c => c === clue || this.story.clues.find(sc => sc.id === c || sc.name === c)
+                            );
+                            
+                            if (!existingClue) {
+                                state.discovered_clues.push(clue);
+                                
+                                // 手がかりの詳細を見つける（IDまたは名前で検索）
+                                let clueDetails = this.story.clues.find(c => c.id === clue);
+                                if (!clueDetails) {
+                                    clueDetails = this.story.clues.find(c => c.name === clue);
+                                }
+                                
+                                // 手がかり発見メッセージを追加
+                                state.messages.push({
+                                    type: "system",
+                                    content: `新しい手がかりを発見: ${clueDetails ? clueDetails.name : clue}`,
+                                    clue: true
+                                });
+                            }
+                        }
+                    }
+                    
+                    // 新しいアイテムを追加
+                    if (result.new_items && result.new_items.length > 0) {
+                        this.debug(`新しいアイテム: ${JSON.stringify(result.new_items)}`);
+                        
+                        for (const item of result.new_items) {
+                            if (!state.inventory.includes(item)) {
+                                state.inventory.push(item);
+                                
+                                // アイテム取得メッセージを追加
+                                state.messages.push({
+                                    type: "system",
+                                    content: `アイテムを獲得: ${item}`,
+                                    item: true
+                                });
+                            }
+                        }
+                    }
+                    
+                    // キャラクターとの遭遇を処理
+                    if (action === "talk" || action === "ask") {
+                        if (!state.game_progress.met_characters) {
+                            state.game_progress.met_characters = [];
+                        }
+
+                        let characterId = target;
+                        if (action === "ask" && target.includes(" about ")) {
+                            characterId = target.split(" about ")[0];
+                        }
+
+                        // 名前→ID変換
+                        let charObj = this.story.characters.find(
+                            c => c.id === characterId || c.name === characterId
+                        );
+                        if (charObj) characterId = charObj.id;
+
+                        if (characterId && !state.game_progress.met_characters.includes(characterId)) {
+                            state.game_progress.met_characters.push(characterId);
+                        }
+                    }
+                    
+                    // 利用可能なアクションを更新
+                    state.available_actions = result.available_actions;
+                    
+                    // 次のシーンを設定
+                    if (result.next_scene) {
+                        state.current_scene = result.next_scene;
+                    }
+                    
+                    // アクションの結果をメッセージに追加
+                    state.messages.push({
+                        type: "narrative",
+                        content: result.description
+                    });
+                    
+                    // ストーリー内で登場したキャラクターを検出して追加
+                    if (result.description) {
+                        // ストーリー内のキャラクターを検出
+                        const mentionedCharacters = this.story.characters.filter(character => 
+                            result.description.includes(character.name)
+                        );
+
+                        // met_characters配列を初期化（存在しない場合）
+                        if (!state.game_progress.met_characters) {
+                            state.game_progress.met_characters = [];
+                        }
+
+                        // 検出したキャラクターを追加
+                        for (const character of mentionedCharacters) {
+                            if (!state.game_progress.met_characters.includes(character.id)) {
+                                state.game_progress.met_characters.push(character.id);
+                                this.debug(`ストーリー内でキャラクターを検出: ${character.name} (${character.id})`);
+                            }
+                        }
+                    }
+                    
+                    return state;
+                } catch (error) {
+                    console.error("アクション処理エラー:", error);
                     throw error;
                 }
             }
@@ -836,10 +984,18 @@ Return your analysis in JSON format:
                     const character = this.getCharacterInfo(characterId);
                     
                     if (!character) {
-                        throw new Error(`Character ${characterId} not found`);
+                        throw new Error(`キャラクター${characterId}が見つかりません`);
                     }
                     
-                    // Use the dialogue manager to ensure consistency
+                    // このキャラクターをmet_charactersに追加することを確認
+                    if (!this.gameState.game_progress.met_characters) {
+                        this.gameState.game_progress.met_characters = [];
+                    }
+                    if (!this.gameState.game_progress.met_characters.includes(characterId)) {
+                        this.gameState.game_progress.met_characters.push(characterId);
+                    }
+                    
+                    // 一貫性を確保するためにダイアログマネージャーを使用
                     const dialogueContext = this.dialogueManager.getDialogueContext(characterId);
                     
                     const messages = [
@@ -849,20 +1005,20 @@ Return your analysis in JSON format:
                         },
                         {
                             role: "user",
-                            content: `Generate dialogue for the character:
+                            content: `キャラクターのダイアログを生成:
                             
-Character information: ${JSON.stringify(character)}
-Current scene: ${this.gameState.current_scene}
-Discovered clues: ${JSON.stringify(this.gameState.discovered_clues)}
-Previous dialogue context: ${JSON.stringify(dialogueContext)}
-Topic: ${topic || 'general conversation'}
+キャラクター情報: ${JSON.stringify(character)}
+現在のシーン: ${this.gameState.current_scene}
+発見した手がかり: ${JSON.stringify(this.gameState.discovered_clues)}
+前回の対話コンテキスト: ${JSON.stringify(dialogueContext)}
+トピック: ${topic || '一般的な会話'}
 
-Return the dialogue in JSON format:
+ダイアログをJSON形式で返してください:
 {
-    "dialogue": "The character's dialogue",
-    "emotion": "The character's emotional state",
-    "hints": ["Any hints provided in the dialogue"],
-    "next_topics": ["Potential next topics for conversation"]
+    "dialogue": "キャラクターのダイアログ",
+    "emotion": "キャラクターの感情状態",
+    "hints": ["ダイアログで提供されたヒント"],
+    "next_topics": ["次の会話の潜在的なトピック"]
 }`
                         }
                     ];
@@ -870,7 +1026,7 @@ Return the dialogue in JSON format:
                     const completion = await this._callOpenAI(messages);
                     const dialogueData = this._safeParseJSON(completion);
                     
-                    // Update the dialogue context
+                    // ダイアログコンテキストを更新
                     this.dialogueManager.updateDialogueContext(characterId, {
                         lastTopic: topic,
                         lastEmotion: dialogueData.emotion,
@@ -878,7 +1034,7 @@ Return the dialogue in JSON format:
                         timestamp: Date.now()
                     });
                     
-                    // Add the dialogue to messages
+                    // ダイアログをメッセージに追加
                     this.gameState.messages.push({
                         type: "character",
                         character: character.name,
@@ -886,15 +1042,15 @@ Return the dialogue in JSON format:
                         emotion: dialogueData.emotion
                     });
                     
-                    // Check if there are new clues in the hints
+                    // ヒントに新しい手がかりがあるかどうかを確認
                     if (dialogueData.hints && dialogueData.hints.length > 0) {
-                        // Process new clues through clue manager
+                        // 手がかりマネージャーを通じて新しい手がかりを処理
                         this._processNewClues(dialogueData.hints);
                     }
                     
                     return dialogueData;
                 } catch (error) {
-                    console.error("Error getting character dialogue:", error);
+                    console.error("キャラクターダイアログの取得エラー:", error);
                     throw error;
                 }
             }
@@ -1084,237 +1240,6 @@ Structure your output in the following JSON format:
             }
             
             /**
-             * Process a player action
-             * @param {Object} state Current game state
-             * @param {string} action Action type
-             * @param {string} target Target of the action
-             * @returns {Promise<Object>} Updated game state
-             */
-            async _processAction(state, action, target) {
-                try {
-                    this.debug(`Processing action: ${action} ${target}`);
-                    
-                    const messages = [
-                        {
-                            role: "system",
-                            content: "あなたは、プレイヤーのアクションを処理するアドベンチャーゲームエンジンです。レスポンスを有効なJSONとして返してください。レスポンスにバックスティック（`）やその他の書式を使用しないでください。言語は日本語で書いてください。"
-                        },
-                        {
-                            role: "user",
-                            content: `Process the player's action:
-                            
-Action: ${action}
-Target: ${target}
-Current scene: ${state.current_scene}
-Story context: ${JSON.stringify(this.story)}
-Inventory: ${JSON.stringify(state.inventory)}
-Discovered clues: ${JSON.stringify(state.discovered_clues)}
-Game progress: ${JSON.stringify(state.game_progress)}
-
-Return the result in JSON format:
-{
-    "next_scene": "ID of the next scene",
-    "description": "Description of what happens",
-    "new_clues": ["New clues discovered"],
-    "new_items": ["New items acquired"],
-    "available_actions": ["Available actions after this action"]
-}`
-                        }
-                    ];
-                    
-                    const completion = await this._callOpenAI(messages);
-                    const result = this._safeParseJSON(completion);
-                    
-                    // Add the result to messages
-                    state.messages.push({
-                        type: "narrative",
-                        content: result.description
-                    });
-                    
-                    // Update the state
-                    state.current_scene = result.next_scene;
-                    
-                    // Add new clues
-                    if (result.new_clues && result.new_clues.length > 0) {
-                        this._processNewClues(result.new_clues);
-                    }
-                    
-                    // Add new items
-                    if (result.new_items && result.new_items.length > 0) {
-                        for (const item of result.new_items) {
-                            if (!state.inventory.includes(item)) {
-                                state.inventory.push(item);
-                                // Add item acquisition message
-                                state.messages.push({
-                                    type: "system",
-                                    content: `You acquired: ${item}`,
-                                    item: true
-                                });
-                            }
-                        }
-                    }
-                    
-                    // Update available actions
-                    state.available_actions = result.available_actions;
-                    
-                    // Check for game progress updates
-                    if (action === "move") {
-                        if (!state.game_progress.visited_locations) {
-                            state.game_progress.visited_locations = [];
-                        }
-                        if (!state.game_progress.visited_locations.includes(target)) {
-                            state.game_progress.visited_locations.push(target);
-                        }
-                    }
-                    
-                    if (action === "talk" || action === "ask") {
-                        if (!state.game_progress.met_characters) {
-                            state.game_progress.met_characters = [];
-                        }
-                        if (!state.game_progress.met_characters.includes(target)) {
-                            state.game_progress.met_characters.push(target);
-                        }
-                    }
-                    
-                    return { ...state, description: result.description, new_clues: result.new_clues, new_items: result.new_items };
-                } catch (error) {
-                    console.error("Error processing action:", error);
-                    throw error;
-                }
-            }
-            
-            /**
-             * Update the scene based on the current game state
-             * @param {Object} state Current game state
-             * @returns {Promise<Object>} Updated game state
-             */
-            async _updateScene(state) {
-                // Check if the scene needs to be updated based on story arc
-                try {
-                    const currentScene = state.current_scene;
-                    const sceneInfo = this.story.story_arc.find(scene => scene.scene_id === currentScene);
-                    
-                    if (!sceneInfo) {
-                        return state;
-                    }
-                    
-                    // Check if any required clues for the scene are missing
-                    const missingClues = sceneInfo.required_clues.filter(
-                        clue => !state.discovered_clues.includes(clue)
-                    );
-                    
-                    if (missingClues.length > 0) {
-                        // The scene cannot progress yet
-                        return state;
-                    }
-                    
-                    // Check for special scene transitions
-                    if (sceneInfo.next_scenes && sceneInfo.next_scenes.length > 0) {
-                        // Let the story manager decide the next scene for consistency
-                        const nextScene = this.storyManager.getNextScene(currentScene, state.discovered_clues, state.game_progress);
-                        
-                        if (nextScene && nextScene !== currentScene) {
-                            // Get the next scene info
-                            const { description, available_actions } = await this._getSceneInfo(nextScene);
-                            
-                            // Add the scene transition to messages
-                            state.messages.push({
-                                type: "system",
-                                content: `Transitioning to: ${nextScene}`,
-                                transition: true
-                            });
-                            
-                            state.messages.push({
-                                type: "narrative",
-                                content: description
-                            });
-                            
-                            // Update the state
-                            state.current_scene = nextScene;
-                            state.available_actions = available_actions;
-                        }
-                    }
-                    
-                    return state;
-                } catch (error) {
-                    console.error("Error updating scene:", error);
-                    return state;
-                }
-            }
-            
-            /**
-             * Manage clues in the game state
-             * @param {Object} state Current game state
-             * @returns {Promise<Object>} Updated game state
-             */
-            async _manageClues(state) {
-                try {
-                    // Already processed clues during action processing
-                    return state;
-                } catch (error) {
-                    console.error("Error managing clues:", error);
-                    return state;
-                }
-            }
-            
-            /**
-             * Process new clues discovered by the player
-             * @param {Array} newClues Array of new clue IDs
-             */
-            _processNewClues(newClues) {
-                for (const clue of newClues) {
-                    if (!this.gameState.discovered_clues.includes(clue)) {
-                        this.gameState.discovered_clues.push(clue);
-                        
-                        // Find the clue details
-                        const clueDetails = this.story.clues.find(c => c.id === clue);
-                        
-                        // Add clue discovery message
-                        this.gameState.messages.push({
-                            type: "system",
-                            content: `New clue discovered: ${clueDetails ? clueDetails.name : clue}`,
-                            clue: true
-                        });
-                    }
-                }
-            }
-            
-            /**
-             * Get the available actions for a scene
-             * @param {string} scene Scene ID
-             * @returns {Promise<Array>} Available actions
-             */
-            async _getAvailableActions(scene) {
-                try {
-                    const messages = [
-                        {
-                            role: "system",
-                            content: "あなたは、利用可能なアクションを決定するアドベンチャーゲームエンジンです。レスポンスを有効なJSONとして返してください。レスポンスにバックスティック（`）やその他の書式を使用しないでください。言語は日本語で書いてください。"
-                        },
-                        {
-                            role: "user",
-                            content: `現在のシーンで使用可能なアクションを決定する:
-                            
-Current scene: ${scene}
-Story context: ${JSON.stringify(this.story)}
-
-Return the available actions in JSON array format:
-[
-    {"action": "action_type", "description": "Action description", "target": "action_target"},
-    ...
-]`
-                        }
-                    ];
-                    
-                    const completion = await this._callOpenAI(messages);
-                    return this._safeParseJSON(completion);
-                } catch (error) {
-                    console.error("Error getting available actions:", error);
-                    return [];
-                }
-            }
-            
-            /**
              * Get information about a scene
              * @param {string} scene Scene ID
              * @returns {Promise<Object>} Scene information
@@ -1385,7 +1310,7 @@ Return the scene information in JSON format:
              */
             async _callOpenAI(messages) {
                 try {
-                    this.debug(`Calling OpenAI API`);
+                    this.debug(`OpenAI APIを呼び出し中`);
                     
                     const response = await fetch('https://api.openai.com/v1/chat/completions', {
                         method: 'POST',
@@ -1397,25 +1322,25 @@ Return the scene information in JSON format:
                             model: 'gpt-4o-mini',
                             messages,
                             temperature: 0.7,
-                            response_format: { type: "text" }  // Ensuring text format, not JSON format
+                            // JSON形式を強制しない - APIがテキスト形式でJSON文字列を返せるようにする
+                            response_format: { type: "text" }
                         })
                     });
                     
                     if (!response.ok) {
                         const errorData = await response.json();
-                        throw new Error(`OpenAI API error: ${errorData.error?.message || response.status}`);
+                        throw new Error(`OpenAI APIエラー: ${errorData.error?.message || response.status}`);
                     }
                     
                     const data = await response.json();
                     const completion = data.choices[0].message.content;
                     
-                    this.debug(`Received response from OpenAI (${completion.length} chars)`);
+                    this.debug(`OpenAIからのレスポンス (${completion.length} 文字)`);
                     
-                    // Return the raw response for processing elsewhere
                     return completion;
                 } catch (error) {
-                    console.error("Error calling OpenAI:", error);
-                    this.debug(`OpenAI API error: ${error.message}`);
+                    console.error("OpenAI呼び出しエラー:", error);
+                    this.debug(`OpenAI APIエラー: ${error.message}`);
                     throw error;
                 }
             }
@@ -1427,33 +1352,33 @@ Return the scene information in JSON format:
              */
             _safeParseJSON(jsonString) {
                 try {
-                    // First attempt: direct parsing
+                    // 最初の試み: 直接パース
                     return JSON.parse(jsonString);
                 } catch (err) {
-                    this.debug(`JSON parse error: ${err.message}`);
+                    this.debug(`JSONパースエラー: ${err.message}`);
                     
                     try {
-                        // Second attempt: Extract JSON from a markdown code block or similar
+                        // 二番目の試み: マークダウンコードブロックなどからJSONを抽出
                         const jsonMatch = jsonString.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
                         if (jsonMatch && jsonMatch[1]) {
-                            this.debug("Found JSON in code block, trying to parse it");
+                            this.debug("コードブロック内のJSONを発見、パース試行");
                             return JSON.parse(jsonMatch[1]);
                         }
                         
-                        // Third attempt: Try to fix the JSON
-                        this.debug("Attempting to fix malformed JSON");
+                        // 三番目の試み: JSONを修正
+                        this.debug("不正なJSONの修正を試みる");
                         const fixedJson = this._fixJSON(jsonString);
                         return JSON.parse(fixedJson);
                     } catch (secondError) {
-                        this.debug(`All JSON parse attempts failed: ${secondError.message}`);
-                        this.debug(`Raw JSON string: ${jsonString.substring(0, 200)}...`);
+                        this.debug(`全てのJSONパース試行が失敗: ${secondError.message}`);
+                        this.debug(`生のJSON文字列: ${jsonString.substring(0, 200)}...`);
                         
-                        // As a last resort, create a minimal valid object
-                        this.debug("Creating fallback object");
+                        // 最終手段として、最小限の有効なオブジェクトを作成
+                        this.debug("フォールバックオブジェクトを作成");
                         return {
-                            error: "Failed to parse response",
+                            error: "レスポンスの解析に失敗しました",
                             fallback: true,
-                            description: "There was an error processing the game data. Please try again.",
+                            description: "ゲームデータの処理中にエラーが発生しました。もう一度やり直してください。",
                             available_actions: []
                         };
                     }
@@ -1494,6 +1419,80 @@ Return the scene information in JSON format:
                     });
                 
                 return cleaned;
+            }
+
+            async _getAvailableActions(scene) {
+                try {
+                    const messages = [
+                        {
+                            role: "system",
+                            content: "あなたは、プレイヤーのアクションを処理するアドベンチャーゲームエンジンです。レスポンスを有効なJSONとして返してください。レスポンスにバックスティック（`）やその他の書式を使用しないでください。言語は日本語で書いてください。"
+                        },
+                        {
+                            role: "user",
+                            content: `現在のシーンで利用可能なアクションを取得:
+                            
+現在のシーン: ${scene}
+ストーリーコンテキスト: ${JSON.stringify(this.story)}
+インベントリ: ${JSON.stringify(this.gameState.inventory)}
+発見した手がかり: ${JSON.stringify(this.gameState.discovered_clues)}
+ゲームの進行: ${JSON.stringify(this.gameState.game_progress)}
+
+利用可能なアクションをJSON形式で返してください:
+{
+    "available_actions": [
+        {"action": "action_type", "description": "アクションの説明", "target": "アクションの対象"},
+        ...
+    ]
+}`
+                        }
+                    ];
+                    
+                    const completion = await this._callOpenAI(messages);
+                    const result = this._safeParseJSON(completion);
+                    
+                    return result.available_actions || [];
+                } catch (error) {
+                    console.error("利用可能なアクションの取得エラー:", error);
+                    return [];
+                }
+            }
+
+            /**
+             * Process new clues from dialogue hints
+             * @param {Array} hints Array of hint strings
+             */
+            _processNewClues(hints) {
+                if (!hints || !Array.isArray(hints)) return;
+                
+                this.debug(`新しい手がかりを処理: ${JSON.stringify(hints)}`);
+                
+                for (const hint of hints) {
+                    // 手がかりが既に存在するかチェック
+                    const existingClue = this.gameState.discovered_clues.find(
+                        c => c === hint || this.story.clues.find(sc => sc.id === c || sc.name === c)
+                    );
+                    
+                    if (!existingClue) {
+                        // 手がかりを追加
+                        this.gameState.discovered_clues.push(hint);
+                        
+                        // 手がかりの詳細を見つける
+                        let clueDetails = this.story.clues.find(c => c.id === hint);
+                        if (!clueDetails) {
+                            clueDetails = this.story.clues.find(c => c.name === hint);
+                        }
+                        
+                        // 手がかり発見メッセージを追加
+                        this.gameState.messages.push({
+                            type: "system",
+                            content: `新しい手がかりを発見: ${clueDetails ? clueDetails.name : hint}`,
+                            clue: true
+                        });
+                        
+                        this.debug(`手がかりを追加: ${hint}`);
+                    }
+                }
             }
         }
         
@@ -1767,6 +1766,153 @@ Return the scene information in JSON format:
             }
         }
 
+        /**
+         * Game State Consistency Manager
+         * Ensures overall game state consistency
+         */
+        class GameStateConsistencyManager {
+            constructor() {
+                this.lastValidState = null;
+                this.consistencyChecks = new Map();
+                this.initializeConsistencyChecks();
+            }
+
+            /**
+             * Initialize consistency check functions
+             */
+            initializeConsistencyChecks() {
+                // ストーリーの整合性チェック
+                this.consistencyChecks.set('story', (gameState, story) => {
+                    const issues = [];
+                    
+                    // 現在のシーンが存在するか
+                    if (!story.story_arc.find(scene => scene.scene_id === gameState.current_scene)) {
+                        issues.push(`現在のシーン "${gameState.current_scene}" がストーリーに存在しません`);
+                    }
+                    
+                    // 手がかりの整合性
+                    for (const clueId of gameState.discovered_clues) {
+                        if (!story.clues.find(clue => clue.id === clueId || clue.name === clueId)) {
+                            issues.push(`手がかり "${clueId}" がストーリーに存在しません`);
+                        }
+                    }
+                    
+                    return issues;
+                });
+
+                // キャラクターの整合性チェック
+                this.consistencyChecks.set('characters', (gameState, story) => {
+                    const issues = [];
+                    
+                    // 出会ったキャラクターの整合性
+                    if (gameState.game_progress.met_characters) {
+                        for (const charId of gameState.game_progress.met_characters) {
+                            if (!story.characters.find(char => char.id === charId || char.name === charId)) {
+                                issues.push(`出会ったキャラクター "${charId}" がストーリーに存在しません`);
+                            }
+                        }
+                    }
+                    
+                    return issues;
+                });
+
+                // アイテムの整合性チェック
+                this.consistencyChecks.set('items', (gameState, story) => {
+                    const issues = [];
+                    
+                    // インベントリの整合性
+                    for (const item of gameState.inventory) {
+                        let itemExists = false;
+                        for (const location of story.locations) {
+                            if (location.items && location.items.includes(item)) {
+                                itemExists = true;
+                                break;
+                            }
+                        }
+                        if (!itemExists) {
+                            issues.push(`アイテム "${item}" がストーリーに存在しません`);
+                        }
+                    }
+                    
+                    return issues;
+                });
+
+                // ロケーションの整合性チェック
+                this.consistencyChecks.set('locations', (gameState, story) => {
+                    const issues = [];
+                    
+                    // 現在のロケーションの整合性
+                    const currentLocation = story.locations.find(loc => 
+                        loc.id === gameState.current_scene || 
+                        loc.connected_locations.includes(gameState.current_scene)
+                    );
+                    
+                    if (!currentLocation) {
+                        issues.push(`現在のロケーション "${gameState.current_scene}" がストーリーに存在しません`);
+                    }
+                    
+                    return issues;
+                });
+            }
+
+            /**
+             * Save the current state as the last valid state
+             * @param {Object} gameState Current game state
+             */
+            saveLastValidState(gameState) {
+                this.lastValidState = JSON.parse(JSON.stringify(gameState));
+            }
+
+            /**
+             * Check consistency of the current game state
+             * @param {Object} gameState Current game state
+             * @param {Object} story Story object
+             * @returns {Object} Consistency check result
+             */
+            checkConsistency(gameState, story) {
+                const allIssues = [];
+                const checkResults = {};
+
+                // 各整合性チェックを実行
+                for (const [checkName, checkFunction] of this.consistencyChecks) {
+                    const issues = checkFunction(gameState, story);
+                    if (issues.length > 0) {
+                        checkResults[checkName] = issues;
+                        allIssues.push(...issues);
+                    }
+                }
+
+                return {
+                    isConsistent: allIssues.length === 0,
+                    issues: allIssues,
+                    checkResults: checkResults
+                };
+            }
+
+            /**
+             * Restore the last valid state if current state is inconsistent
+             * @param {Object} gameState Current game state
+             * @param {Object} story Story object
+             * @returns {Object} Either the current state or the last valid state
+             */
+            ensureConsistency(gameState, story) {
+                const consistencyResult = this.checkConsistency(gameState, story);
+                
+                if (!consistencyResult.isConsistent) {
+                    console.warn("ゲーム状態の整合性エラーを検出:", consistencyResult.issues);
+                    
+                    if (this.lastValidState) {
+                        console.log("最後の有効な状態に戻します");
+                        return this.lastValidState;
+                    }
+                }
+                
+                // 現在の状態が整合性を保っている場合、それを保存
+                this.saveLastValidState(gameState);
+                return gameState;
+            }
+        }
+
         // Game Engine Instance
         const gameEngine = new AdventureGameEngine();
 
@@ -1932,6 +2078,31 @@ Return the scene information in JSON format:
             
             await performAction(actionType, target);
         });
+
+        // キャラクターとの会話を処理する関数
+        async function handleCharacterDialogue(characterId) {
+            try {
+                loadingAction.style.display = 'block';
+                
+                // キャラクターの情報を取得
+                const character = gameEngine.getCharacterInfo(characterId);
+                if (!character) {
+                    throw new Error(`キャラクターが見つかりません: ${characterId}`);
+                }
+                
+                // キャラクターとの会話を生成
+                const dialogue = await gameEngine.getCharacterDialogue(characterId);
+                
+                // ゲーム表示を更新
+                updateGameDisplay();
+                
+                loadingAction.style.display = 'none';
+            } catch (error) {
+                console.error("キャラクターとの会話エラー:", error);
+                alert(`エラー: ${error.message}`);
+                loadingAction.style.display = 'none';
+            }
+        }
 
         // Get Hint
         getHintBtn.addEventListener('click', async () => {
@@ -2202,17 +2373,28 @@ Return the scene information in JSON format:
                 performActionBtn.disabled = true;
                 loadingAction.style.display = 'block';
                 
+                // アクションを処理
                 const result = await gameEngine.processAction(action, target);
-                console.log("----------->");
-                console.log(result);
-                console.log("-----------<");
-                // Clear action input
+                
+                // ゲーム状態を更新
+                gameEngine.gameState = result;
+                
+                // アクション入力欄をクリア
                 actionTargetInput.value = '';
                 
-                // Update game display
+                // ゲーム表示を更新
                 updateGameDisplay();
                 
-                // Check if the game is completed
+                // インベントリ表示を更新
+                updateInventoryDisplay();
+                
+                // 手がかり表示を更新
+                updateCluesDisplay();
+                
+                // キャラクター表示を更新
+                updateCharactersDisplay();
+                
+                // ゲームの完了状態をチェック
                 const completion = await gameEngine.checkGameCompletion();
                 if (completion.is_completed) {
                     appendToGameOutput(`<div style="background-color: #2a3950; padding: 15px; border-radius: 5px; margin: 10px 0; border-left: 4px solid #d4af37;">
@@ -2224,8 +2406,8 @@ Return the scene information in JSON format:
                 loadingAction.style.display = 'none';
                 performActionBtn.disabled = false;
             } catch (error) {
-                console.error("Error performing action:", error);
-                alert(`Error: ${error.message}`);
+                console.error("アクション実行エラー:", error);
+                alert(`エラー: ${error.message}`);
                 loadingAction.style.display = 'none';
                 performActionBtn.disabled = false;
             }
@@ -2298,10 +2480,18 @@ Return the scene information in JSON format:
             }
             
             for (const clueId of clues) {
-                // Find clue details
-                const clueDetails = gameEngine.story.clues.find(c => c.id === clueId);
+                // 手がかりの詳細を見つける（IDまたは名前で検索）
+                let clueDetails = gameEngine.story.clues.find(c => c.id === clueId);
                 
-                if (!clueDetails) continue;
+                // IDで見つからない場合は名前で検索
+                if (!clueDetails) {
+                    clueDetails = gameEngine.story.clues.find(c => c.name === clueId);
+                }
+                
+                if (!clueDetails) {
+                    console.warn(`Clue not found: ${clueId}`);
+                    continue;
+                }
                 
                 const clueElement = document.createElement('div');
                 clueElement.className = 'clue-item';
@@ -2320,68 +2510,102 @@ Return the scene information in JSON format:
          * Update characters display
          */
         function updateCharactersDisplay() {
-            characterList.innerHTML = '';
-            
-            if (!gameEngine.gameState) return;
-            
-            // Only show characters the player has met
-            const metCharacters = gameEngine.gameState.game_progress.met_characters || [];
-console.log("updateCharactersDisplay----------------->");
-            console.log(metCharacters);
-console.log("-----------------<");            
-            if (metCharacters.length === 0) {
-                characterList.innerHTML = '<p>You haven\'t met any characters yet.</p>';
-                return;
+    characterList.innerHTML = '';
+    
+    if (!gameEngine.gameState) return;
+    
+    // Check if game_progress exists
+    if (!gameEngine.gameState.game_progress) {
+        gameEngine.gameState.game_progress = {};
+    }
+    
+    // Only show characters the player has met
+    const metCharacters = gameEngine.gameState.game_progress.met_characters || [];
+    
+    console.log("Met characters:", metCharacters);
+    
+    if (metCharacters.length === 0) {
+        // If no characters have been met explicitly, try showing all characters from current location
+        const currentScene = gameEngine.gameState.current_scene;
+        const currentLocation = Object.values(gameEngine.gameState.locations).find(
+            loc => loc.id === currentScene || loc.connected_locations.includes(currentScene)
+        );
+        
+        if (currentLocation && currentLocation.characters && currentLocation.characters.length > 0) {
+            // Show characters in current location
+            for (const characterId of currentLocation.characters) {
+                renderCharacterElement(characterId);
             }
-            
-            for (const characterId of metCharacters) {
-                const character = gameEngine.getCharacterInfo(characterId);
-
-                console.log(character);
-                
-                if (!character) continue;
-                
-                const characterElement = document.createElement('div');
-                characterElement.className = 'character-item';
-                characterElement.style.backgroundColor = '#2a3950';
-                characterElement.style.padding = '15px';
-                characterElement.style.marginBottom = '15px';
-                characterElement.style.borderRadius = '5px';
-                
-                characterElement.innerHTML = `
-                    <h4>${character.name}</h4>
-                    <p><strong>Age:</strong> ${character.age}</p>
-                    <p><strong>Occupation:</strong> ${character.occupation}</p>
-                    <p><strong>Description:</strong> ${character.description}</p>
-                `;
-                
-                // Add talk button
-                const talkBtn = document.createElement('button');
-                talkBtn.textContent = 'Talk to this character';
-                talkBtn.className = 'action-btn';
-                talkBtn.addEventListener('click', () => {
-                    performAction('talk', character.id);
-                });
-                
-                characterElement.appendChild(talkBtn);
-                
-                // Add ask button
-                const askBtn = document.createElement('button');
-                askBtn.textContent = 'Ask about...';
-                askBtn.className = 'action-btn';
-                askBtn.style.marginLeft = '10px';
-                askBtn.addEventListener('click', () => {
-                    const topic = prompt('What would you like to ask about?');
-                    if (topic) {
-                        performAction('ask', `${character.id} about ${topic}`);
-                    }
-                });
-                
-                characterElement.appendChild(askBtn);
-                
-                characterList.appendChild(characterElement);
-            }
+            return;
         }
+        
+        characterList.innerHTML = '<p>You haven\'t met any characters yet.</p>';
+        return;
+    }
+    
+    // Render characters the player has met
+    for (const characterId of metCharacters) {
+        renderCharacterElement(characterId);
+    }
+    
+    // Helper function to render a character element
+    function renderCharacterElement(characterId) {
+        let character = gameEngine.getCharacterInfo(characterId);
+
+        // 名前で検索してIDを逆引き
+        if (!character) {
+            const charObj = Object.values(gameEngine.gameState.characters).find(
+                c => c.name === characterId
+            );
+            if (charObj) character = charObj;
+        }
+
+        if (!character) {
+            console.warn(`Character not found: ${characterId}`);
+            return;
+        }
+        
+        const characterElement = document.createElement('div');
+        characterElement.className = 'character-item';
+        characterElement.style.backgroundColor = '#2a3950';
+        characterElement.style.padding = '15px';
+        characterElement.style.marginBottom = '15px';
+        characterElement.style.borderRadius = '5px';
+        
+        characterElement.innerHTML = `
+            <h4>${character.name}</h4>
+            <p><strong>Age:</strong> ${character.age}</p>
+            <p><strong>Occupation:</strong> ${character.occupation}</p>
+            <p><strong>Description:</strong> ${character.description}</p>
+        `;
+        
+        // 話しかけるボタン
+        const talkBtn = document.createElement('button');
+        talkBtn.textContent = 'このキャラクターと話す';
+        talkBtn.className = 'action-btn';
+        talkBtn.addEventListener('click', () => {
+            handleCharacterDialogue(character.id);
+        });
+        
+        characterElement.appendChild(talkBtn);
+        
+        // 質問ボタン
+        const askBtn = document.createElement('button');
+        askBtn.textContent = '質問する...';
+        askBtn.className = 'action-btn';
+        askBtn.style.marginLeft = '10px';
+        askBtn.addEventListener('click', () => {
+            const topic = prompt('何について質問しますか？');
+            if (topic) {
+                performAction('ask', `${character.id} about ${topic}`);
+            }
+        });
+        
+        characterElement.appendChild(askBtn);
+        
+        characterList.appendChild(characterElement);
+    }
+}
 
         /**
          * Update help display
